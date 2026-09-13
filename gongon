@@ -1,0 +1,728 @@
+#!/bin/bash
+# ╔═══════════════════════════════════════════════════════════════╗
+# ║          AIVORA AI - Complete Auto-Installer v2.0            ║
+# ║     One-Click Installation - Production Ready Platform        ║
+# ╚═══════════════════════════════════════════════════════════════╝
+
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# Functions
+print_banner() {
+    clear
+    echo -e "${CYAN}"
+    cat << "EOF"
+╔═══════════════════════════════════════════════════════════════╗
+║                                                               ║
+║          █████╗ ██╗   ██╗████████╗██╗  ██╗███████╗          ║
+║         ██╔══██╗██║   ██║╚══██╔══╝██║  ██║██╔════╝          ║
+║         ███████║██║   ██║   ██║   ███████║█████╗            ║
+║         ██══██║██║   ██║   ██║   ██╔══██║██╔══╝            ║
+║         ██║  ██║╚██████╝   ██║   ██║  ██║███████╗          ║
+║         ╚═╝  ╚═╝ ╚═════╝    ╚═╝   ╚═╝  ╚═╝══════╝          ║
+║                                                               
+║                  AI Platform - Auto Installer                 ║
+║                     Version 2.0 - 2026                        ║
+║                                                               ║
+╚═══════════════════════════════════════════════════════════════╝
+EOF
+    echo -e "${NC}\n"
+}
+
+log_info() { echo -e "${BLUE}[✓]${NC} $1"; }
+log_success() { echo -e "${GREEN}[✔]${NC} $1"; }
+log_warning() { echo -e "${YELLOW}[!]${NC} $1"; }
+log_error() { echo -e "${RED}[✗]${NC} $1"; }
+
+# Check root
+if [ "$EUID" -ne 0 ]; then 
+    log_error "Please run as root: sudo bash $0"
+    exit 1
+fi
+
+print_banner
+
+# Configuration
+INSTALL_DIR="/opt/aivora-ai"
+DOMAIN=""
+EMAIL=""
+INSTALL_MODE="full"  # full, minimal, local-ai
+
+# Interactive setup
+echo -e "${CYAN}═══ Installation Configuration ═══${NC}\n"
+read -p "Domain (e.g., ai.yoursite.com): " DOMAIN
+read -p "Email for SSL: " EMAIL
+echo ""
+echo "Installation Mode:"
+echo "  1) Full (Web + API + Database + Local AI)"
+echo "  2) Minimal (Web + API + Database only)"
+echo "  3) Local AI Only (Ollama + Models)"
+read -p "Choose [1-3]: " MODE_CHOICE
+
+case $MODE_CHOICE in
+    2) INSTALL_MODE="minimal" ;;
+    3) INSTALL_MODE="local-ai" ;;
+    *) INSTALL_MODE="full" ;;
+esac
+
+echo ""
+log_info "Configuration:"
+echo "   Domain: $DOMAIN"
+echo "   Email: $EMAIL"
+echo "   Mode: $INSTALL_MODE"
+echo ""
+read -p "Continue? [y/N]: " CONFIRM
+if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+    log_error "Installation cancelled"
+    exit 1
+fi
+
+# Create installation directory
+mkdir -p $INSTALL_DIR
+cd $INSTALL_DIR
+
+# Step 1: System Update
+log_info "Updating system packages..."
+apt-get update -qq
+apt-get upgrade -y -qq
+
+# Step 2: Install Docker
+log_info "Installing Docker..."
+if ! command -v docker &> /dev/null; then
+    curl -fsSL https://get.docker.com -o get-docker.sh
+    bash get-docker.sh
+    rm get-docker.sh
+    systemctl enable docker
+    systemctl start docker
+    log_success "Docker installed"
+else
+    log_info "Docker already installed"
+fi
+
+# Install Docker Compose
+log_info "Installing Docker Compose..."
+if [ ! -f /usr/bin/docker-compose ]; then
+    curl -fsSL "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
+        -o /usr/local/bin/docker-compose
+    chmod +x /usr/local/bin/docker-compose
+    ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
+    log_success "Docker Compose installed"
+fi
+
+# Step 3: Create Docker Compose File
+log_info "Creating Docker Compose configuration..."
+cat > docker-compose.yml << 'DOCKEREOF'
+version: '3.8'
+
+services:
+  # PostgreSQL Database with pgvector
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: aivora-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: aivora
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-aivora_secure_pass_2026}
+      POSTGRES_DB: aivora_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - aivora-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aivora"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: aivora-redis
+    restart: always
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    networks:
+      - aivora-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MinIO Object Storage
+  minio:
+    image: minio/minio:latest
+    container_name: aivora-minio
+    restart: always
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-aivora_admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-aivora_secret_2026}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - aivora-network
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
+  # Backend API
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: aivora-api
+    restart: always
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://aivora:${DB_PASSWORD:-aivora_secure_pass_2026}@postgres:5432/aivora_db
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET}
+      SESSION_SECRET: ${SESSION_SECRET}
+      MINIO_ENDPOINT: minio
+      MINIO_PORT: 9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-aivora_admin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-aivora_secret_2026}
+      OLLAMA_HOST: http://ollama:11434
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    networks:
+      - aivora-network
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+
+  # Frontend (Next.js)
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: aivora-web
+    restart: always
+    environment:
+      NEXT_PUBLIC_API_URL: https://api.${DOMAIN}
+      NODE_ENV: production
+    depends_on:
+      - api
+    networks:
+      - aivora-network
+    volumes:
+      - ./frontend:/app
+      - /app/.next
+      - /app/node_modules
+
+  # Ollama (Local AI Models)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: aivora-ollama
+    restart: always
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - aivora-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Remove deploy section if no GPU available
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: aivora-nginx
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+      - ./certs:/etc/letsencrypt:ro
+    depends_on:
+      - web
+      - api
+    networks:
+      - aivora-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  ollama_data:
+
+networks:
+  aivora-network:
+    driver: bridge
+DOCKEREOF
+
+log_success "Docker Compose created"
+
+# Step 4: Create Backend
+log_info "Creating backend structure..."
+mkdir -p backend
+cat > backend/package.json << 'EOF'
+{
+  "name": "aivora-api",
+  "version": "2.0.0",
+  "description": "AIVORA AI Platform - Backend API",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "ts-node-dev --respawn src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "migrate": "node dist/database/migrate.js",
+    "seed": "node dist/database/seed.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "helmet": "^7.1.0",
+    "compression": "^1.7.4",
+    "dotenv": "^16.3.1",
+    "pg": "^8.11.3",
+    "redis": "^4.6.11",
+    "jsonwebtoken": "^9.0.2",
+    "bcrypt": "^5.1.1",
+    "express-validator": "^7.0.1",
+    "multer": "^1.4.5-lts.1",
+    "minio": "^7.1.3",
+    "openai": "^4.20.1",
+    "axios": "^1.6.2",
+    "winston": "^3.11.0",
+    "express-rate-limit": "^7.1.5",
+    "cookie-parser": "^1.4.6",
+    "express-session": "^1.17.3"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.10.5",
+    "typescript": "^5.3.3",
+    "ts-node-dev": "^2.0.0"
+  }
+}
+EOF
+
+mkdir -p backend/src
+cat > backend/src/server.ts << 'EOF'
+import express from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import compression from 'compression';
+import cookieParser from 'cookie-parser';
+import rateLimit from 'express-rate-limit';
+import { logger } from './utils/logger';
+
+const app = express();
+const PORT = process.env.PORT || 4000;
+
+// Security middleware
+app.use(helmet());
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  credentials: true
+}));
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100 // limit each IP to 100 requests per windowMs
+});
+app.use('/api/', limiter);
+
+// Body parsing
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(compression());
+app.use(cookieParser());
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
+  });
+});
+
+// API Routes
+app.use('/api/v1/chat', require('./routes/chat'));
+app.use('/api/v1/files', require('./routes/files'));
+app.use('/api/v1/auth', require('./routes/auth'));
+app.use('/api/v1/users', require('./routes/users'));
+
+// Error handling
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  logger.error('Error:', err);
+  res.status(err.status || 500).json({
+    error: {
+      message: err.message || 'Internal Server Error',
+      status: err.status || 500
+    }
+  });
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+  logger.info(`🚀 AIVORA API Server running on port ${PORT}`);
+  logger.info(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);
+});
+
+export default app;
+EOF
+
+# Create additional backend files (simplified for brevity)
+mkdir -p backend/src/{routes,models,middleware,utils,services}
+
+cat > backend/src/utils/logger.ts << 'EOF'
+import winston from 'winston';
+
+export const logger = winston.createLogger({
+  level: process.env.LOG_LEVEL || 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.json()
+  ),
+  transports: [
+    new winston.transports.Console(),
+    new winston.transports.File({ filename: 'error.log', level: 'error' })
+  ]
+});
+EOF
+
+cat > backend/tsconfig.json << 'EOF'
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "commonjs",
+    "lib": ["ES2020"],
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}
+EOF
+
+cat > backend/Dockerfile << 'EOF'
+FROM node:20-alpine
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci --only=production
+
+COPY . .
+RUN npm run build
+
+EXPOSE 4000
+
+CMD ["npm", "start"]
+EOF
+
+log_success "Backend created"
+
+# Step 5: Create Frontend
+log_info "Creating frontend structure..."
+mkdir -p frontend
+cat > frontend/package.json << 'EOF'
+{
+  "name": "aivora-web",
+  "version": "2.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "next": "14.2.5",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "ai": "^3.0.0",
+    "zustand": "^4.4.7",
+    "tailwindcss": "^3.4.0",
+    "autoprefixer": "^10.4.16",
+    "postcss": "^8.4.32",
+    "lucide-react": "^0.294.0",
+    "react-markdown": "^9.0.1",
+    "rehype-highlight": "^7.0.0",
+    "remark-gfm": "^4.0.0",
+    "axios": "^1.6.2",
+    "date-fns": "^3.0.6"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.5",
+    "@types/react": "^18.2.45",
+    "@types/react-dom": "^18.2.18",
+    "typescript": "^5.3.3"
+  }
+}
+EOF
+
+mkdir -p frontend/src/{app,components,lib,store}
+
+cat > frontend/src/app/layout.tsx << 'EOF'
+import type { Metadata } from 'next'
+import { Vazirmatn } from 'next/font/google'
+import './globals.css'
+
+const vazirmatn = Vazirmatn({ 
+  subsets: ['arabic', 'latin'],
+  variable: '--font-vazir'
+})
+
+export const metadata: Metadata = {
+  title: 'AIVORA AI - هوش مصنوعی همه‌کاره',
+  description: 'پلتفرم هوش مصنوعی برای چت، تولید محتوا، تحلیل فایل و کدنویسی',
+  manifest: '/manifest.json',
+}
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode
+}) {
+  return (
+    <html lang="fa" dir="rtl" className={vazirmatn.variable}>
+      <body className="font-sans bg-background text-foreground">
+        {children}
+      </body>
+    </html>
+  )
+}
+EOF
+
+cat > frontend/src/app/page.tsx << 'EOF'
+'use client'
+
+import { useState } from 'react'
+import ChatInterface from '@/components/ChatInterface'
+
+export default function Home() {
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true)
+
+  return (
+    <div className="flex h-screen bg-background">
+      {/* Sidebar */}
+      <aside className={`${isSidebarOpen ? 'w-64' : 'w-0'} transition-all duration-300 bg-muted border-l border-border`}>
+        <div className="p-4">
+          <button 
+            onClick={() => setIsSidebarOpen(!isSidebarOpen)}
+            className="w-full px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90"
+          >
+            + گفتگوی جدید
+          </button>
+        </div>
+      </aside>
+
+      {/* Main Content */}
+      <main className="flex-1 flex flex-col">
+        {/* Header */}
+        <header className="h-14 border-b border-border flex items-center px-4">
+          <button 
+            onClick={() => setIsSidebarOpen(!isSidebarOpen)}
+            className="p-2 hover:bg-muted rounded-lg"
+          >
+            ☰
+          </button>
+          <h1 className="flex-1 text-center font-bold text-lg">AIVORA AI</h1>
+          <div className="w-10" /> {/* Spacer */}
+        </header>
+
+        {/* Chat Interface */}
+        <ChatInterface />
+      </main>
+    </div>
+  )
+}
+EOF
+
+cat > frontend/src/components/ChatInterface.tsx << 'EOF'
+'use client'
+
+import { useState, useRef, useEffect } from 'react'
+import { useChat } from 'ai/react'
+
+export default function ChatInterface() {
+  const messagesEndRef = useRef<HTMLDivElement>(null)
+  const [attachments, setAttachments] = useState<File[]>([])
+  
+  const { messages, input, handleInputChange, handleSubmit, isLoading, stop } = useChat({
+    api: '/api/chat',
+    onFinish: () => {
+      // Scroll to bottom
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    }
+  })
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages])
+
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files) {
+      setAttachments([...attachments, ...Array.from(e.target.files)])
+    }
+  }
+
+  return (
+    <div className="flex-1 flex flex-col overflow-hidden">
+      {/* Messages */}
+      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        {messages.length === 0 && (
+          <div className="flex flex-col items-center justify-center h-full text-center p-8">
+            <h2 className="text-2xl font-bold mb-2">به AIVORA AI خوش آمدید</h2>
+            <p className="text-muted-foreground mb-6">
+              یک هوش مصنوعی برای همه کارها
+            </p>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 max-w-2xl w-full">
+              <div className="p-4 border border-border rounded-lg hover:bg-muted cursor-pointer">
+                <h3 className="font-semibold mb-1">💬 چت هوشمند</h3>
+                <p className="text-sm text-muted-foreground">پرسش و پاسخ با هوش مصنوعی</p>
+              </div>
+              <div className="p-4 border border-border rounded-lg hover:bg-muted cursor-pointer">
+                <h3 className="font-semibold mb-1">📄 تحلیل فایل</h3>
+                <p className="text-sm text-muted-foreground">PDF، Word، Excel</p>
+              </div>
+              <div className="p-4 border border-border rounded-lg hover:bg-muted cursor-pointer">
+                <h3 className="font-semibold mb-1">🎨 تولید تصویر</h3>
+                <p className="text-sm text-muted-foreground">ساخت تصویر با AI</p>
+              </div>
+              <div className="p-4 border border-border rounded-lg hover:bg-muted cursor-pointer">
+                <h3 className="font-semibold mb-1">💻 کدنویسی</h3>
+                <p className="text-sm text-muted-foreground">تولید و دیباگ کد</p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {messages.map((message) => (
+          <div
+            key={message.id}
+            className={`flex ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
+          >
+            <div
+              className={`max-w-[80%] rounded-lg px-4 py-2 ${
+                message.role === 'user'
+                  ? 'bg-primary text-primary-foreground'
+                  : 'bg-muted'
+              }`}
+            >
+              <div className="whitespace-pre-wrap">{message.content}</div>
+            </div>
+          </div>
+        ))}
+        <div ref={messagesEndRef} />
+      </div>
+
+      {/* Input Area */}
+      <div className="border-t border-border p-4">
+        {attachments.length > 0 && (
+          <div className="flex gap-2 mb-2 overflow-x-auto">
+            {attachments.map((file, index) => (
+              <div key={index} className="flex items-center gap-2 px-3 py-1 bg-muted rounded-lg">
+                <span className="text-sm truncate max-w-[150px]">{file.name}</span>
+                <button
+                  onClick={() => setAttachments(attachments.filter((_, i) => i !== index))}
+                  className="text-muted-foreground hover:text-foreground"
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        
+        <form onSubmit={handleSubmit} className="flex gap-2">
+          <input
+            type="file"
+            multiple
+            onChange={handleFileSelect}
+            className="hidden"
+            id="file-input"
+          />
+          <label
+            htmlFor="file-input"
+            className="px-4 py-2 border border-border rounded-lg cursor-pointer hover:bg-muted"
+          >
+            
+          </label>
+          
+          <input
+            type="text"
+            value={input}
+            onChange={handleInputChange}
+            placeholder="پیام خود را بنویسید..."
+            className="flex-1 px-4 py-2 border border-border rounded-lg bg-background focus:outline-none focus:ring-2 focus:ring-primary"
+            disabled={isLoading}
+          />
+          
+          {isLoading ? (
+            <button
+              type="button"
+              onClick={stop}
+              className="px-4 py-2 bg-destructive text-destructive-foreground rounded-lg hover:bg-destructive/90"
+            >
+              توقف
+            </button>
+          ) : (
+            <button
+              type="submit"
+              className="px-6 py-2 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 disabled:opacity-50"
+              disabled={!input.trim()}
+            >
+              ارسال
+            </button>
+          )}
+        </form>
+      </div>
+    </div>
+  )
+}
+EOF
+
+cat > frontend/src/app/globals.css << 'EOF'
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 222.2 84% 4.9%;
+    --primary: 222.2 47.4% 11.2%;
+    --primary-foreground: 210 40% 98%;
+    --muted: 210 40% 96.1%;
+    --muted-foreground: 215.4 16.3% 46.9%;
+    --border: 214.3 31.8% 91.4%;
+  }
+
+  .dark {
+    --background: 222.2 84% 4.9%;
+    --foreground: 210 40% 98%;
+    --primary: 210
